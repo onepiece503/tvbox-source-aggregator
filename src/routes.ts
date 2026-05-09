@@ -2,8 +2,9 @@
 
 import { Hono } from 'hono';
 import type { Storage } from './storage/interface';
-import type { AppConfig, SourceEntry, MacCMSSourceEntry, LiveSourceEntry, NameTransformConfig } from './core/types';
-import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_MANUAL_SOURCES, KV_LAST_UPDATE, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, LIVE_PROXY_TTL, IMG_PROXY_TTL, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_CRON_INTERVAL, DEFAULT_CRON_INTERVAL, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_EDGE_PROXIES, KV_SEARCH_QUOTA_REPORT } from './core/config';
+import type { AppConfig, SourceEntry, MacCMSSourceEntry, LiveSourceEntry, NameTransformConfig, EdgeProxyConfig } from './core/types';
+import { KV_MERGED_CONFIG, KV_MERGED_CONFIG_FULL, KV_MANUAL_SOURCES, KV_LAST_UPDATE, KV_MACCMS_SOURCES, KV_LIVE_SOURCES, KV_BLACKLIST, LIVE_PROXY_TTL, IMG_PROXY_TTL, KV_INLINE_PREFIX, KV_NAME_TRANSFORM, KV_CRON_INTERVAL, DEFAULT_CRON_INTERVAL, KV_SOURCE_HEALTH, KV_SPEED_TEST_ENABLED, KV_EDGE_PROXIES, KV_SEARCH_QUOTA_REPORT, KV_AGG_LOGS, KV_BG_SETTINGS, KV_DEDUP_CONFIG } from './core/config';
+import { loadGroupOrder, saveGroupOrder } from './core/group-order';
 import { parseConfigJson, isMultiRepoConfig, extractMultiRepoEntries } from './core/fetcher';
 import { decodeConfigResponse } from './core/decoder';
 import { validateMacCMS } from './core/maccms';
@@ -66,6 +67,39 @@ export function createApp(deps: AppDeps): Hono {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'public, max-age=1800',
         'Access-Control-Allow-Origin': '*',
+      });
+    } catch {
+      return c.json({ error: 'Config parse error' }, 500);
+    }
+  });
+
+  // ─── .json 下载别名 ────────────────────────────────────
+  app.get('/index.json', async (c) => {
+    const cached = await storage.get(KV_MERGED_CONFIG);
+    if (!cached) {
+      return c.json({ error: 'No config available yet.' }, 503);
+    }
+    return c.body(cached, 200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'public, max-age=1800',
+      'Access-Control-Allow-Origin': '*',
+      'Content-Disposition': 'attachment; filename="tvbox-config.json"',
+    });
+  });
+
+  app.get('/live.json', async (c) => {
+    const cached = await storage.get(KV_MERGED_CONFIG);
+    if (!cached) {
+      return c.json({ error: 'No config available yet.' }, 503);
+    }
+    try {
+      const full = JSON.parse(cached);
+      const liveConfig = { lives: full.lives || [] };
+      return c.body(JSON.stringify(liveConfig), 200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'public, max-age=1800',
+        'Access-Control-Allow-Origin': '*',
+        'Content-Disposition': 'attachment; filename="tvbox-live.json"',
       });
     } catch {
       return c.json({ error: 'Config parse error' }, 500);
@@ -717,8 +751,8 @@ export function createApp(deps: AppDeps): Hono {
     });
   });
 
-  // ─── MacCMS 边缘代理（仅 CF 版）──────────────────────
-  if (config.workerBaseUrl) {
+  // ─── MacCMS API 代理（CF 版 + 本地版）──────────────────────
+  if (config.workerBaseUrl || config.localBaseUrl) {
     app.all('/api/:key', async (c) => {
       const key = c.req.param('key');
       const raw = await storage.get(KV_MACCMS_SOURCES);
@@ -729,22 +763,62 @@ export function createApp(deps: AppDeps): Hono {
         return c.json({ error: 'Unknown MacCMS source' }, 404);
       }
 
-      try {
-        const targetUrl = new URL(source.api);
-        const reqUrl = new URL(c.req.url);
-        reqUrl.searchParams.forEach((v, k) => targetUrl.searchParams.set(k, v));
+      const targetUrl = new URL(source.api);
+      const reqUrl = new URL(c.req.url);
+      reqUrl.searchParams.forEach((v, k) => targetUrl.searchParams.set(k, v));
 
-        const resp = await fetch(targetUrl.toString());
-        const data = await resp.json();
+      // 构造候选请求链：本地模式下优先走 edge（Vercel → CF），兜底直连
+      const attempts: { label: string; url: string; headers: Record<string, string> }[] = [];
 
-        return c.json(data, 200, {
-          'Access-Control-Allow-Origin': '*',
-          'Cache-Control': 'public, max-age=300',
-        });
-      } catch (error: unknown) {
-        const msg = error instanceof Error ? error.message : String(error);
-        return c.json({ error: msg }, 502);
+      if (!config.workerBaseUrl) {
+        const edgeRaw = await storage.get(KV_EDGE_PROXIES);
+        if (edgeRaw) {
+          const edge: EdgeProxyConfig = JSON.parse(edgeRaw);
+          const encoded = encodeURIComponent(targetUrl.toString());
+          if (edge.vercel) {
+            attempts.push({
+              label: 'vercel',
+              url: `${edge.vercel.replace(/\/$/, '')}/api/proxy?url=${encoded}`,
+              headers: {},
+            });
+          }
+          if (edge.cf) {
+            attempts.push({
+              label: 'cf',
+              url: `${edge.cf.replace(/\/$/, '')}/fetch-proxy?url=${encoded}`,
+              headers: config.adminToken ? { Authorization: `Bearer ${config.adminToken}` } : {},
+            });
+          }
+        }
       }
+
+      attempts.push({ label: 'direct', url: targetUrl.toString(), headers: {} });
+
+      let lastError = '';
+      for (const { label, url, headers } of attempts) {
+        try {
+          const resp = await fetch(url, {
+            headers: { 'User-Agent': 'okhttp/3.12.0', ...headers },
+            signal: AbortSignal.timeout(8000),
+          });
+          if (!resp.ok) {
+            lastError = `upstream ${resp.status}`;
+            console.log(`[maccms-proxy] ${key} via ${label} fail: ${lastError}`);
+            continue;
+          }
+          const data = await resp.json();
+          console.log(`[maccms-proxy] ${key} via ${label} ok`);
+          return c.json(data, 200, {
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=300',
+          });
+        } catch (error: unknown) {
+          lastError = error instanceof Error ? error.message : String(error);
+          console.log(`[maccms-proxy] ${key} via ${label} fail: ${lastError}`);
+        }
+      }
+
+      return c.json({ error: lastError || 'All proxies failed' }, 502);
     });
   }
 
@@ -1288,6 +1362,123 @@ export function createApp(deps: AppDeps): Hono {
     await saveBlacklist(storage, blacklist);
 
     return c.json({ success: true });
+  });
+
+  // ─── 聚合日志 ──────────────────────────────────────────
+  app.get('/admin/agg-logs', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const raw = await storage.get(KV_AGG_LOGS);
+    const logs = raw ? JSON.parse(raw) : [];
+    const limitStr = c.req.query('limit');
+    const limit = limitStr ? Math.min(parseInt(limitStr) || 20, 50) : 20;
+    const sliced = logs.slice(-limit).reverse();
+    return c.json({ total: logs.length, logs: sliced });
+  });
+
+  app.delete('/admin/agg-logs', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    await storage.put(KV_AGG_LOGS, '[]');
+    return c.json({ success: true });
+  });
+
+  // ─── 分组排序 ──────────────────────────────────────────
+  app.get('/admin/group-order', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const cfg = await loadGroupOrder(storage);
+    return c.json(cfg);
+  });
+
+  app.put('/admin/group-order', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { rules?: unknown; unmatchedPosition?: string; enabled?: boolean };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      rules: Array.isArray(body.rules) ? body.rules : [],
+      unmatchedPosition: (body.unmatchedPosition === 'before' ? 'before' : 'after') as 'before' | 'after',
+      enabled: body.enabled !== false,
+    };
+    await saveGroupOrder(storage, cfg);
+    return c.json({ success: true, ...cfg });
+  });
+
+  // ─── 去重配置 ──────────────────────────────────────────
+  app.get('/admin/dedup-config', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const raw = await storage.get(KV_DEDUP_CONFIG);
+    if (!raw) {
+      return c.json({ similarDedup: true, similarDedupThreshold: 0.85 });
+    }
+    try {
+      return c.json(JSON.parse(raw));
+    } catch {
+      return c.json({ similarDedup: true, similarDedupThreshold: 0.85 });
+    }
+  });
+
+  app.put('/admin/dedup-config', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { similarDedup?: boolean; similarDedupThreshold?: number };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      similarDedup: body.similarDedup !== false,
+      similarDedupThreshold: typeof body.similarDedupThreshold === 'number'
+        ? Math.max(0.5, Math.min(1.0, body.similarDedupThreshold))
+        : 0.85,
+    };
+    await storage.put(KV_DEDUP_CONFIG, JSON.stringify(cfg));
+    return c.json({ success: true, ...cfg });
+  });
+
+  // ─── 背景设置 ──────────────────────────────────────────
+  app.get('/api/bg-settings', async (c) => {
+    const raw = await storage.get(KV_BG_SETTINGS);
+    if (!raw) return c.json({ type: 'default' });
+    try {
+      return c.json(JSON.parse(raw));
+    } catch {
+      return c.json({ type: 'default' });
+    }
+  });
+
+  app.put('/admin/bg-settings', async (c) => {
+    if (!verifyAdmin(c.req.raw, config)) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    let body: { type?: string; imageUrl?: string; overlay?: number; solidColor?: string; gradient?: string };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON' }, 400);
+    }
+    const cfg = {
+      type: body.type || 'default',
+      imageUrl: body.imageUrl || '',
+      overlay: typeof body.overlay === 'number' ? Math.max(0, Math.min(100, body.overlay)) : 85,
+      solidColor: body.solidColor || '#0a0e14',
+      gradient: body.gradient || '',
+    };
+    await storage.put(KV_BG_SETTINGS, JSON.stringify(cfg));
+    return c.json({ success: true, ...cfg });
   });
 
   // ─── 刷新 ─────────────────────────────────────────────
